@@ -118,7 +118,7 @@ let physicsEnabled = false; //for toggling physics
 const blockMaterial = new CANNON.Material({ friction: 10.0, restitution: 0.0 }); //adding high friction so model remains stable
 
 // Connect to the WebSocket server
-const socket = io("http://localhost:3000");   //change after deploying on render first 
+const socket = io(import.meta.env.VITE_BACKEND_URL);   //change after deploying on render first 
 
 //called when player clicks on the ready button 
 function notifyReady() {
