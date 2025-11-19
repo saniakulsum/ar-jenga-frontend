@@ -1,4 +1,4 @@
-import * as THREE from 'three';
+/*import * as THREE from 'three';
 import { ARButton } from 'three/examples/jsm/webxr/ARButton.js';
 
 
@@ -955,3 +955,276 @@ document.addEventListener('DOMContentLoaded', () => {
             renderer.setAnimationLoop(animate);
         });
 });
+*/
+import * as THREE from 'three';
+import { ARButton } from 'three/examples/jsm/webxr/ARButton.js';
+import * as CANNON from 'cannon-es'; // Your physics lib
+import { io } from 'socket.io-client';
+
+// Core variables
+let camera, scene, renderer;
+let controller, reticle;
+let hitTestSource = null,
+    hitTestSourceRequested = false;
+
+let socket;
+let roomId = null;
+let gameStarted = false;
+let canMove = false; // Player turn control flag
+
+// Physics world & blocks
+const world = new CANNON.World();
+const cubes = [];        // Three.js mesh array for blocks
+const cubeBodies = [];   // Cannon.js physics bodies
+
+// Interaction state
+let selectedBlock = null;
+let selectedBlockInitialQuaternion = null;
+let isTouching = false;
+let touchStart = null;
+let lastTapTime = 0;
+
+// Initialize AR, scene, renderer, and multiplayer socket
+function init() {
+  // Three.js scene and camera
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera();
+
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.xr.enabled = true;
+  document.body.appendChild(renderer.domElement);
+
+  // Lighting
+  scene.add(new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1));
+
+  // AR Button
+  document.body.appendChild(
+    ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] })
+  );
+
+  // Reticle - surface indicator
+  reticle = new THREE.Mesh(
+    new THREE.RingGeometry(0.07, 0.1, 32).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: 0x00ff00 })
+  );
+  reticle.matrixAutoUpdate = false;
+  reticle.visible = false;
+  scene.add(reticle);
+
+  // Get XR controller for input
+  controller = renderer.xr.getController(0);
+  controller.addEventListener('select', onSelect);
+  scene.add(controller);
+
+  // Setup Physics
+  world.gravity.set(0, -9.82, 0);
+  // Add basic ground body with fixed mass
+  const groundBody = new CANNON.Body({ mass: 0 });
+  groundBody.addShape(new CANNON.Plane());
+  groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+  world.addBody(groundBody);
+
+  // Setup networking
+  socket = io("https://ar-jenga-backendrender.onrender.com");
+  setupSocket();
+
+  // Add input listeners for selection and dragging
+  window.addEventListener('pointerdown', onInteractionStart);
+  window.addEventListener('pointermove', onInteractionMove);
+  window.addEventListener('pointerup', onInteractionEnd);
+  window.addEventListener('touchstart', onInteractionStart);
+  window.addEventListener('touchmove', onInteractionMove);
+  window.addEventListener('touchend', onInteractionEnd);
+
+  renderer.setAnimationLoop(render);
+}
+
+function render(timestamp, frame) {
+  if (frame) {
+    const referenceSpace = renderer.xr.getReferenceSpace();
+    const session = renderer.xr.getSession();
+
+    if (!hitTestSourceRequested) {
+      session.requestReferenceSpace('viewer').then(refSpace => {
+        session.requestHitTestSource({ space: refSpace }).then(source => {
+          hitTestSource = source;
+        });
+      });
+      session.addEventListener('end', () => {
+        hitTestSourceRequested = false;
+        hitTestSource = null;
+      });
+      hitTestSourceRequested = true;
+    }
+
+    if (hitTestSource) {
+      const hitTestResults = frame.getHitTestResults(hitTestSource);
+      if (hitTestResults.length) {
+        const hit = hitTestResults[0];
+        const pose = hit.getPose(referenceSpace);
+        reticle.visible = true;
+        reticle.matrix.fromArray(pose.transform.matrix);
+      } else {
+        reticle.visible = false;
+      }
+    }
+  }
+  
+  // Physics step
+  world.step(1 / 60);
+  updateMeshesFromPhysics();
+
+  renderer.render(scene, camera);
+}
+
+// Sync Three mesh positions with physics bodies
+function updateMeshesFromPhysics() {
+  for (let i = 0; i < cubes.length; i++) {
+    cubes[i].position.copy(cubeBodies[i].position);
+    cubes[i].quaternion.copy(cubeBodies[i].quaternion);
+  }
+}
+
+// Called on AR touch tap - place Jenga tower or debug cube
+function onSelect() {
+  if (reticle.visible) {
+    placeBlockAtReticle();
+  }
+}
+
+function placeBlockAtReticle() {
+  // For now place a simple cube at reticle pos
+  const geometry = new THREE.BoxGeometry(0.1, 0.05, 0.3);
+  const material = new THREE.MeshStandardMaterial({ color: 0x885522 });
+  
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.position.setFromMatrixPosition(reticle.matrix);
+  scene.add(mesh);
+  
+  // Physics body for the mesh
+  const shape = new CANNON.Box(new CANNON.Vec3(0.05, 0.025, 0.15));
+  const body = new CANNON.Body({ mass: 1 });
+  body.addShape(shape);
+  body.position.copy(mesh.position);
+  world.addBody(body);
+
+  cubes.push(mesh);
+  cubeBodies.push(body);
+
+  console.log("Block placed at", mesh.position);
+  // TODO: Notify server to sync multiplayer
+}
+
+// Multiplayer socket setup
+function setupSocket() {
+  socket.on('connect', () => {
+    console.log('Socket connected: ', socket.id);
+  });
+
+  socket.on('roomCreated', (id) => {
+    roomId = id;
+    console.log('Room created with ID: ', roomId);
+  });
+
+  socket.on('joinedRoom', (data) => {
+    roomId = data.roomId;
+    console.log('Joined room: ', roomId);
+  });
+  
+  socket.on('roomError', (msg) => {
+    console.warn('Room error: ', msg);
+  });
+
+  // Add more event handlers for multiplayer game sync
+}
+
+// Input handlers for selecting and moving blocks
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+
+function onInteractionStart(event) {
+  event.preventDefault();
+
+  if(!gameStarted || !canMove) return;
+
+  // Get normalized pointer coords
+  getPointer(event);
+
+  raycaster.setFromCamera(pointer, camera);
+  const intersects = raycaster.intersectObjects(cubes);
+  if(intersects.length > 0) {
+    selectedBlock = cubeBodies[cubes.indexOf(intersects[0].object)];
+    selectedBlockInitialQuaternion = selectedBlock.quaternion.clone();
+
+    // Disable physics temporarily for smooth dragging
+    selectedBlock.mass = 0;
+    selectedBlock.updateMassProperties();
+
+    isTouching = true;
+    touchStart = getEventClientPosition(event);
+  }
+}
+
+function onInteractionMove(event) {
+  if(!isTouching || !selectedBlock || !canMove) return;
+
+  const currentPos = getEventClientPosition(event);
+  const deltaX = (currentPos.x - touchStart.x) * 0.005;
+  const deltaZ = (currentPos.y - touchStart.y) * 0.005;
+
+  selectedBlock.position.x += deltaX;
+  selectedBlock.position.z += deltaZ;
+
+  // Update Three mesh position too
+  const idx = cubeBodies.indexOf(selectedBlock);
+  if(idx !== -1) {
+    cubes[idx].position.copy(selectedBlock.position);
+  }
+
+  touchStart = currentPos;
+}
+
+function onInteractionEnd(event) {
+  if(!isTouching || !selectedBlock || !canMove) return;
+
+  const currentTapTime = Date.now();
+  if(currentTapTime - lastTapTime < 300) {
+    // Double tap - confirm placement
+    selectedBlock.mass = 1;
+    selectedBlock.updateMassProperties();
+
+    if(selectedBlockInitialQuaternion) {
+      selectedBlock.quaternion.copy(selectedBlockInitialQuaternion);
+    }
+
+    // TODO: Send multiplayer block placement update
+
+    selectedBlock = null;
+    isTouching = false;
+  }
+  lastTapTime = currentTapTime;
+}
+
+function getPointer(event) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  if(event.touches) {
+    pointer.x = ((event.touches[0].clientX - rect.left) / rect.width) * 2 - 1;
+    pointer.y = -((event.touches[0].clientY - rect.top) / rect.height) * 2 + 1;
+  } else {
+    pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  }
+}
+
+function getEventClientPosition(event) {
+  if(event.touches) {
+    return new THREE.Vector2(event.touches[0].clientX, event.touches[0].clientY);
+  } else {
+    return new THREE.Vector2(event.clientX, event.clientY);
+  }
+}
+
+// Start AR on page load
+window.addEventListener('DOMContentLoaded', init);
